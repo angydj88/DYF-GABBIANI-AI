@@ -6,7 +6,7 @@ import pandas as pd
 import os
 import html as html_module
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+# ◄◄◄ ELIMINADO: from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from core import (
     PERFILES, MotorVision, CerebroOperarioV5,
@@ -21,12 +21,13 @@ st.set_page_config(page_title="GABBIANI MASTER AI v7", layout="wide",
                    page_icon="🔷", initial_sidebar_state="collapsed")
 
 BACKEND = st.secrets.get("BACKEND", "google_ai")
-GEMINI_MODEL = st.secrets.get("GEMINI_MODEL", "gemini-2.5-pro-preview-06-05")
-MAX_WORKERS = int(st.secrets.get("MAX_WORKERS", 5))
+GEMINI_MODEL = st.secrets.get("GEMINI_MODEL", "gemini-2.0-flash")  # ◄◄◄ Flash por defecto en EU
+# ◄◄◄ MAX_WORKERS ya no se usa para API, solo informativo
+MAX_WORKERS = 1  # ◄◄◄ Secuencial para respetar rate limits EU
 backend_label = "Vertex AI" if BACKEND == "vertex_ai" else "Google AI Studio"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CSS PREMIUM COMPLETO
+# CSS PREMIUM COMPLETO (sin cambios)
 # ══════════════════════════════════════════════════════════════════════════════
 st.markdown("""
 <style>
@@ -707,15 +708,16 @@ st.markdown(f"""
             <span class="hero-tag">Enterprise</span>
         </div>
         <p class="hero-desc">
-            Pipeline dual con concurrencia {MAX_WORKERS}x — extracción vectorial determinista
-            combinada con Gemini 2.5 Pro en modo híbrido (visión + texto).
-            Exportación HDR6,90 nativa para seccionadora. Trazabilidad completa.
+            Pipeline dual secuencial — extracción vectorial determinista
+            combinada con {GEMINI_MODEL} en modo híbrido (visión + texto).
+            Rate limiting adaptativo para servidor EU.
+            Exportación HDR6,90 nativa para seccionadora.
         </p>
         <div class="hero-chips">
             <div class="chip chip-live"><span class="chip-dot green"></span> Operativo</div>
             <div class="chip chip-info"><span class="chip-dot blue"></span> {GEMINI_MODEL}</div>
             <div class="chip chip-info"><span class="chip-dot blue"></span> {backend_label}</div>
-            <div class="chip chip-neutral">⚡ {MAX_WORKERS} workers</div>
+            <div class="chip chip-neutral">🇪🇺 EU Rate Limited</div>
             <div class="chip chip-neutral">{datetime.now().strftime("%d/%m/%Y · %H:%M")}</div>
         </div>
     </div>
@@ -727,7 +729,7 @@ st.markdown("""
     <div class="trust-item"><span class="ti">🛡️</span> Procesamiento seguro</div>
     <div class="trust-item"><span class="ti">🔒</span> Datos no almacenados</div>
     <div class="trust-item"><span class="ti">✅</span> Validación por reglas de ingeniería</div>
-    <div class="trust-item"><span class="ti">📐</span> Precisión híbrida Vector + Visión</div>
+    <div class="trust-item"><span class="ti">⏱️</span> Rate limiting adaptativo EU</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -750,7 +752,7 @@ with st.sidebar:
             + ("\n".join(extras) + "\n" if extras else "") +
             f"Backend:   {backend_label}\n"
             f"Modelo:    {GEMINI_MODEL}\n"
-            f"Workers:   {MAX_WORKERS}")
+            f"Modo:      Secuencial (EU)")  # ◄◄◄ Actualizado
     st.markdown("---")
     dpi_sel = st.select_slider("Resolución DPI", [150,200,250,300], value=300)
     mostrar_debug = st.checkbox("Mostrar trazabilidad", value=True)
@@ -796,6 +798,14 @@ if uploaded_file:
     pags_texto = sum(1 for d in datos_pdf if d.tiene_texto)
     pags_tablas = sum(1 for d in datos_pdf if d.tiene_tablas)
 
+    # ◄◄◄ Estimar tiempo según modelo
+    if "pro" in GEMINI_MODEL.lower():
+        _seg_por_pag = 15  # Pro EU: ~15s por página
+    elif "flash" in GEMINI_MODEL.lower():
+        _seg_por_pag = 6   # Flash EU: ~6s por página
+    else:
+        _seg_por_pag = 10
+
     st.markdown(f"""
     <div class="kpi-row">
         <div class="kpi kpi-brand">
@@ -816,7 +826,7 @@ if uploaded_file:
         <div class="kpi kpi-brand">
             <div class="kpi-label">Motor IA</div>
             <div class="kpi-value" style="font-size:.68rem">{GEMINI_MODEL.replace('-preview-06-05','')}</div>
-            <div class="kpi-detail">{backend_label} · {MAX_WORKERS}x workers</div>
+            <div class="kpi-detail">{backend_label} · Secuencial EU</div>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -861,17 +871,20 @@ if uploaded_file:
     <div class="dot"></div><div class="line"></div></div>""", unsafe_allow_html=True)
 
     n_sel = len(seleccionadas)
-    tiempo_est = max(3, (n_sel * 9) // MAX_WORKERS)
+    # ◄◄◄ Páginas vectoriales no necesitan API → más rápido
+    pags_solo_ia = sum(1 for dp in seleccionadas if not dp.tiene_tablas)
+    tiempo_est = max(3, pags_solo_ia * _seg_por_pag + (n_sel - pags_solo_ia) * 2)
+
     cb, _, ci = st.columns([2, 1, 3])
     with cb:
         procesar = st.button(f"▶  ANALIZAR  ·  {n_sel} PÁGINAS",
                              type="primary", use_container_width=True,
                              disabled=(n_sel == 0))
     with ci:
-        st.caption(f"~{tiempo_est}s estimado · {MAX_WORKERS} hilos · Pipeline dual")
+        st.caption(f"~{tiempo_est}s estimado · Secuencial · Rate limited EU")  # ◄◄◄
 
     # ══════════════════════════════════════════════════════════════════════
-    # PROCESAMIENTO
+    # PROCESAMIENTO — SECUENCIAL CON RATE LIMITING  ◄◄◄ REESCRITO
     # ══════════════════════════════════════════════════════════════════════
     if procesar and n_sel > 0:
         motor = get_motor()
@@ -882,8 +895,8 @@ if uploaded_file:
         <div class="sec-hdr">
             <div class="sec-icon">🔬</div>
             <div class="sec-body">
-                <div class="sec-title">Pipeline Dual Concurrente</div>
-                <div class="sec-sub">Vectorial → Gemini Híbrido → Reglas de Taller → Validación Física → Deduplicación</div>
+                <div class="sec-title">Pipeline Secuencial · Rate Limited</div>
+                <div class="sec-sub">Vectorial → Gemini → Reglas → Validación → Deduplicación · Una página a la vez</div>
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -892,50 +905,69 @@ if uploaded_file:
         status = st.empty()
         status.markdown("""<div class="proc-card">
             <div class="proc-icon-box">🔄</div>
-            <div><span class="proc-main">Iniciando análisis concurrente…</span>
-            <span class="proc-sub">Preparando workers</span></div>
+            <div><span class="proc-main">Iniciando análisis secuencial…</span>
+            <span class="proc-sub">Rate limiting activo para servidor EU</span></div>
         </div>""", unsafe_allow_html=True)
         barra.progress(5)
 
-        resultados_raw = []
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futuros = {
-                executor.submit(worker_pagina, dp, motor): dp.num
-                for dp in seleccionadas
-            }
-            completados = 0
-            for futuro in as_completed(futuros):
-                completados += 1
-                try:
-                    resultado = futuro.result()
-                    resultados_raw.append(resultado)
-                    num_pag, _, _, estrategia = resultado
-                    status.markdown(f"""<div class="proc-card">
-                        <div class="proc-icon-box">⚡</div>
-                        <div><span class="proc-main">Página {num_pag} completada</span>
-                        <span class="proc-sub">({completados}/{n_sel}) · {estrategia}</span></div>
-                    </div>""", unsafe_allow_html=True)
-                except Exception as e:
-                    alertas_total.append(f"❌ Worker error: {e}")
-                barra.progress(max(5, int((completados / n_sel) * 100)))
+        # ◄◄◄ PROCESAMIENTO SECUENCIAL — Sin ThreadPoolExecutor
+        for idx, dp in enumerate(seleccionadas):
+            num_pag = dp.num + 1
 
-        # Ordenar por página → deduplicación determinista
-        resultados_raw.sort(key=lambda r: r[0])
+            # Actualizar status antes de procesar
+            es_vectorial = dp.tiene_tablas
+            metodo = "📊 Vectorial" if es_vectorial else "🤖 Gemini IA"
+            status.markdown(f"""<div class="proc-card">
+                <div class="proc-icon-box">⏳</div>
+                <div><span class="proc-main">Página {num_pag} · {metodo}</span>
+                <span class="proc-sub">({idx+1}/{n_sel}) · {'Sin API' if es_vectorial else 'Esperando rate limit...'}</span></div>
+            </div>""", unsafe_allow_html=True)
 
-        for num_pag, datos_raw, origen, estrategia in resultados_raw:
-            meta_pags.append(estrategia)
-            if isinstance(datos_raw, list) and datos_raw:
-                if isinstance(datos_raw[0], dict) and "error" in datos_raw[0]:
-                    alertas_total.append(f"❌ Pág {num_pag}: {datos_raw[0]['error']}")
-                else:
-                    pzs, als = cerebro.procesar(datos_raw, num_pag, origen)
-                    piezas_total.extend(pzs)
-                    alertas_total.extend(als)
+            try:
+                resultado = worker_pagina(dp, motor)
+                num, datos_raw, origen, estrategia = resultado
+                meta_pags.append(estrategia)
 
-        status.markdown("""<div class="proc-card" style="border-color:var(--accent-green-border);background:var(--accent-green-bg)">
+                # Verificar errores
+                if isinstance(datos_raw, list) and datos_raw:
+                    if isinstance(datos_raw[0], dict) and "error" in datos_raw[0]:
+                        err = datos_raw[0]["error"]
+                        alertas_total.append(f"❌ Pág {num}: {err}")
+                        status.markdown(f"""<div class="proc-card" style="border-color:var(--accent-red);border-left:3px solid var(--accent-red)">
+                            <div class="proc-icon-box" style="background:var(--accent-red-bg)">❌</div>
+                            <div><span class="proc-main">Página {num} — Error</span>
+                            <span class="proc-sub">{html_module.escape(str(err)[:80])}</span></div>
+                        </div>""", unsafe_allow_html=True)
+                    else:
+                        pzs, als = cerebro.procesar(datos_raw, num, origen)
+                        piezas_total.extend(pzs)
+                        alertas_total.extend(als)
+
+                        # Status de éxito
+                        status.markdown(f"""<div class="proc-card">
+                            <div class="proc-icon-box">✅</div>
+                            <div><span class="proc-main">Página {num} — {len(pzs)} piezas</span>
+                            <span class="proc-sub">({idx+1}/{n_sel}) · {estrategia}</span></div>
+                        </div>""", unsafe_allow_html=True)
+
+            except Exception as e:
+                alertas_total.append(f"❌ Pág {num_pag}: Error inesperado — {e}")
+                status.markdown(f"""<div class="proc-card" style="border-color:var(--accent-red)">
+                    <div class="proc-icon-box" style="background:var(--accent-red-bg)">💥</div>
+                    <div><span class="proc-main">Página {num_pag} — Excepción</span>
+                    <span class="proc-sub">{html_module.escape(str(e)[:80])}</span></div>
+                </div>""", unsafe_allow_html=True)
+
+            # Actualizar progreso
+            progreso = max(5, int(((idx + 1) / n_sel) * 100))
+            barra.progress(progreso)
+
+        # ◄◄◄ FIN del bucle secuencial
+
+        status.markdown(f"""<div class="proc-card" style="border-color:var(--accent-green-border);background:var(--accent-green-bg)">
             <div class="proc-icon-box" style="background:var(--accent-green-bg);border-color:var(--accent-green-border)">✅</div>
-            <div><span class="proc-main" style="color:#065f46">Procesamiento completado</span>
-            <span class="proc-sub">Pipeline dual finalizado con éxito</span></div>
+            <div><span class="proc-main" style="color:#065f46">Procesamiento completado — {len(piezas_total)} piezas</span>
+            <span class="proc-sub">Pipeline secuencial finalizado · Sin errores de rate limit</span></div>
         </div>""", unsafe_allow_html=True)
         barra.progress(100)
 
@@ -955,7 +987,7 @@ if uploaded_file:
         st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RESULTADOS
+# RESULTADOS (sin cambios)
 # ══════════════════════════════════════════════════════════════════════════════
 if 'df_final' in st.session_state:
     df = st.session_state['df_final']
@@ -1080,7 +1112,7 @@ if 'df_final' in st.session_state:
             inf = Auditoria.generar(po, al, perfil_sel,
                                     st.session_state.get('_last_file', 'N/A'),
                                     backend=BACKEND, model=GEMINI_MODEL,
-                                    workers=MAX_WORKERS)
+                                    workers=1)  # ◄◄◄ workers=1
             st.download_button("📄 Auditoría Completa", data=inf.encode('utf-8'),
                                file_name=f"{nb}_auditoria.txt", mime="text/plain",
                                use_container_width=True)
@@ -1095,7 +1127,7 @@ if 'df_final' in st.session_state:
 st.markdown(f"""
 <div class="app-footer">
     <div class="footer-brand">GABBIANI MASTER AI</div>
-    <div class="footer-meta">v7.0 Enterprise · {GEMINI_MODEL} · {backend_label} · HDR6,90 Nativo · Pipeline Dual {MAX_WORKERS}x</div>
+    <div class="footer-meta">v7.0 Enterprise · {GEMINI_MODEL} · {backend_label} · HDR6,90 Nativo · Secuencial EU</div>
     <div class="footer-copy">© 2026 · SISTEMA EXPERTO DE OPTIMIZACIÓN DE CORTE INDUSTRIAL</div>
 </div>
 """, unsafe_allow_html=True)
