@@ -853,7 +853,7 @@ if uploaded_file:
     with c1:
         st.markdown(f"**{act}** de **{tp}** seleccionadas")
     with c2:
-        if st.button("☐ Ninguna" if todas else "☑ Todas", use_container_width=True):
+        if st.button("☐ Ninguna" if todas else "☑ Todas", width="stretch"):
             for i in range(tp): st.session_state[f"chk_{i}"] = not todas
             st.rerun()
 
@@ -864,7 +864,7 @@ if uploaded_file:
             icono = "📝" if dp.tiene_texto else "🖼️"
             tab_tag = " 📊" if dp.tiene_tablas else ""
             m = st.checkbox(f"{icono} Pág {i+1:02d}{tab_tag}", key=f"chk_{i}")
-            st.image(dp.imagen, use_container_width=True)
+            st.image(dp.imagen, width="stretch")
             if m: seleccionadas.append(dp)
 
     st.markdown("""<div class="divider"><div class="line"></div>
@@ -878,7 +878,7 @@ if uploaded_file:
     cb, _, ci = st.columns([2, 1, 3])
     with cb:
         procesar = st.button(f"▶  ANALIZAR  ·  {n_sel} PÁGINAS",
-                             type="primary", use_container_width=True,
+                             type="primary", width="stretch",
                              disabled=(n_sel == 0))
     with ci:
         st.caption(f"~{tiempo_est}s estimado · Secuencial · Rate limited EU")  # ◄◄◄
@@ -1085,7 +1085,7 @@ if 'df_final' in st.session_state:
                 "Notas": st.column_config.TextColumn("Notas", width="large"),
             }
 
-        df_ed = st.data_editor(df, num_rows="dynamic", use_container_width=True,
+        df_ed = st.data_editor(df, num_rows="dynamic", width="stretch",
                                height=600, column_config=cc)
 
         st.markdown("""<div class="divider"><div class="line"></div>
@@ -1103,11 +1103,11 @@ if 'df_final' in st.session_state:
         with c_csv:
             st.download_button("📊 CSV · Revisión", data=csv_b,
                                file_name=f"{nb}_revision.csv", mime="text/csv",
-                               use_container_width=True)
+                               width="stretch")
         with c_txt:
             st.download_button("🤖 TXT GABBIANI · Máquina", data=txt_final,
                                file_name=f"{nb}_GABBIANI.txt", mime="text/plain",
-                               type="primary", use_container_width=True)
+                               type="primary", width="stretch")
         with c_aud:
             inf = Auditoria.generar(po, al, perfil_sel,
                                     st.session_state.get('_last_file', 'N/A'),
@@ -1115,7 +1115,7 @@ if 'df_final' in st.session_state:
                                     workers=1)  # ◄◄◄ workers=1
             st.download_button("📄 Auditoría Completa", data=inf.encode('utf-8'),
                                file_name=f"{nb}_auditoria.txt", mime="text/plain",
-                               use_container_width=True)
+                               width="stretch")
 
         st.caption("🤖 **TXT GABBIANI** = formato `HDR6,90` nativo listo para USB de seccionadora · "
                    "📊 **CSV** = revisión humana en Excel (separador `;`) · "
