@@ -133,20 +133,27 @@ if 'datos_pdf' not in st.session_state:
 st.markdown("""
 <div class="sec-header"><div class="sec-icon">📁</div>
 <div class="sec-text"><div class="sec-title">Importar Proyecto</div>
-<div class="sec-sub">PDF técnico · Extracción dual</div>
+<div class="sec-sub">PDF o DXF con planos técnicos · Extracción dual automática</div>
 </div></div>""", unsafe_allow_html=True)
 
-uploaded_file = st.file_uploader("Selecciona PDF", type=["pdf"])
+uploaded_file = st.file_uploader("Selecciona archivo", type=["pdf", "dxf"])
 
 if uploaded_file:
     nombre_base = os.path.splitext(uploaded_file.name)[0]
     safe_name = html_module.escape(uploaded_file.name)
+    es_dxf = uploaded_file.name.lower().endswith('.dxf')
 
     if st.session_state.get('_last_file') != uploaded_file.name:
         for key in list(st.session_state.keys()):
             if key.startswith("chk_"): del st.session_state[key]
-        with st.spinner(f"Extrayendo capas del PDF a {dpi_sel} DPI..."):
-            st.session_state['datos_pdf'] = pdf_a_datos(uploaded_file, dpi=dpi_sel)
+
+        with st.spinner(f"Extrayendo datos del {'DXF' if es_dxf else 'PDF'}..."):
+            if es_dxf:
+                from core import extraer_datos_dxf
+                st.session_state['datos_pdf'] = extraer_datos_dxf(uploaded_file)
+            else:
+                st.session_state['datos_pdf'] = pdf_a_datos(uploaded_file, dpi=dpi_sel)
+
             st.session_state['_last_file'] = uploaded_file.name
             for k in ['df_final','alertas_final','piezas_obj','meta_pags']:
                 st.session_state.pop(k, None)
