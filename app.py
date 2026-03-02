@@ -7,6 +7,9 @@ import os
 import html as html_module
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import tempfile
+import html
+
 
 # ── Import del core (único import necesario) ──
 from core import (
