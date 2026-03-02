@@ -584,6 +584,199 @@ def pdf_a_datos(archivo, dpi=300) -> list:
     return resultado
 
 # ══════════════════════════════════════════════════════════════════════════════
+# EXTRACTOR DXF (añadir en core.py)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extraer_datos_dxf(archivo_dxf) -> list:
+    """
+    Extrae datos de un archivo DXF y devuelve lista de DatosPagina.
+    
+    Estrategia: NO intentamos parsear geometría (demasiado ambiguo).
+    Extraemos textos + cotas como 'texto vectorial' y renderizamos
+    imagen para que Gemini haga el trabajo de identificación.
+    
+    Requiere: pip install ezdxf matplotlib
+    """
+    import ezdxf
+    from ezdxf.addons.drawing import matplotlib as ezdxf_mpl
+    import matplotlib
+    matplotlib.use('Agg')  # Sin GUI
+    import matplotlib.pyplot as plt
+
+    if hasattr(archivo_dxf, 'read'):
+        # Streamlit UploadedFile → guardar temporalmente
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.dxf', delete=False) as tmp:
+            tmp.write(archivo_dxf.read())
+            tmp_path = tmp.name
+        doc = ezdxf.readfile(tmp_path)
+        os.unlink(tmp_path)
+    else:
+        doc = ezdxf.readfile(archivo_dxf)
+
+    msp = doc.modelspace()
+
+    # ── 1. Extraer todos los textos ──
+    textos = []
+    for entity in msp:
+        if entity.dxftype() == "TEXT":
+            textos.append(entity.dxf.text)
+        elif entity.dxftype() == "MTEXT":
+            textos.append(entity.text)  # MTEXT usa .text no .dxf.text
+
+    # ── 2. Extraer todas las cotas ──
+    cotas = []
+    for entity in msp:
+        if entity.dxftype() == "DIMENSION":
+            try:
+                valor = entity.dxf.actual_measurement
+                if valor and valor > 0:
+                    cotas.append(round(valor, 1))
+            except Exception:
+                pass
+
+    # ── 3. Extraer textos de bloques (INSERT) ──
+    for entity in msp:
+        if entity.dxftype() == "INSERT":
+            try:
+                block = doc.blocks.get(entity.dxf.name)
+                if block:
+                    for sub in block:
+                        if sub.dxftype() == "TEXT":
+                            textos.append(sub.dxf.text)
+                        elif sub.dxftype() == "MTEXT":
+                            textos.append(sub.text)
+                        elif sub.dxftype() == "DIMENSION":
+                            try:
+                                v = sub.dxf.actual_measurement
+                                if v and v > 0:
+                                    cotas.append(round(v, 1))
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+    # ── 4. Construir texto vectorial ──
+    texto_vectorial_parts = []
+    if textos:
+        # Filtrar textos vacíos y duplicados, mantener orden
+        textos_limpio = []
+        vistos = set()
+        for t in textos:
+            t_clean = str(t).strip()
+            if t_clean and t_clean not in vistos:
+                textos_limpio.append(t_clean)
+                vistos.add(t_clean)
+        texto_vectorial_parts.append("TEXTOS DEL DXF:")
+        texto_vectorial_parts.extend(textos_limpio)
+
+    if cotas:
+        # Ordenar cotas de mayor a menor para contexto
+        cotas_unicas = sorted(set(cotas), reverse=True)
+        texto_vectorial_parts.append(f"\nCOTAS ENCONTRADAS ({len(cotas_unicas)}):")
+        texto_vectorial_parts.append(
+            ", ".join(f"{c}mm" for c in cotas_unicas[:50])  # Limitar
+        )
+
+    texto_vectorial = "\n".join(texto_vectorial_parts)
+
+    # ── 5. Renderizar imagen ──
+    imagen = _renderizar_dxf(doc)
+
+    # ── 6. Intentar parseo directo de tablas en texto ──
+    tablas = _buscar_tablas_en_textos_dxf(textos)
+
+    return [DatosPagina(
+        num=0,
+        imagen=imagen,
+        texto=texto_vectorial,
+        tablas=tablas,
+        tiene_texto=len(texto_vectorial) > 20,
+        tiene_tablas=len(tablas) > 0
+    )]
+
+
+def _renderizar_dxf(doc, dpi=200) -> Image.Image:
+    """Renderiza DXF a imagen PIL usando ezdxf backend."""
+    try:
+        from ezdxf.addons.drawing import RenderContext, Frontend
+        from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
+        import matplotlib.pyplot as plt
+
+        fig = plt.figure(dpi=dpi)
+        ax = fig.add_axes([0, 0, 1, 1])
+
+        ctx = RenderContext(doc)
+        out = MatplotlibBackend(ax)
+        Frontend(ctx, out).draw_layout(doc.modelspace())
+
+        ax.set_aspect('equal')
+        ax.axis('off')
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=dpi, bbox_inches='tight',
+                    pad_inches=0.1, facecolor='white')
+        plt.close(fig)
+        buf.seek(0)
+        return Image.open(buf).copy()
+
+    except Exception as e:
+        logger.warning(f"Renderizado DXF falló ({e}), generando placeholder")
+        # Fallback: imagen blanca con texto
+        img = Image.new('RGB', (800, 600), 'white')
+        return img
+
+
+def _buscar_tablas_en_textos_dxf(textos: list) -> list:
+    """
+    Intenta detectar si los textos del DXF forman una tabla de despiece.
+    Busca patrones como "PIEZA 800x450x19 2uds W980"
+    Retorna lista de DataFrames compatibles con ExtractorVectorial.
+    """
+    import pandas as pd
+
+    # Patrón: número x número (opcionalmente x número)
+    patron_medidas = re.compile(
+        r'(\d+(?:[.,]\d+)?)\s*[xX×]\s*(\d+(?:[.,]\d+)?)'
+        r'(?:\s*[xX×]\s*(\d+(?:[.,]\d+)?))?'
+    )
+    # Patrón cantidad: 2uds, 3 ud, x4, qty:5
+    patron_cant = re.compile(
+        r'(\d+)\s*(?:ud|uds|pcs|pzs|unid)|[xX](\d+)|qty[:\s]*(\d+)',
+        re.IGNORECASE
+    )
+
+    filas = []
+    for texto in textos:
+        m = patron_medidas.search(str(texto))
+        if m:
+            largo = float(m.group(1).replace(",", "."))
+            ancho = float(m.group(2).replace(",", "."))
+            espesor = float(m.group(3).replace(",", ".")) if m.group(3) else 19.0
+
+            # Buscar cantidad
+            cant = 1
+            mc = patron_cant.search(str(texto))
+            if mc:
+                cant = int(next(g for g in mc.groups() if g))
+
+            # El nombre es el texto limpio sin las medidas
+            nombre = patron_medidas.sub("", str(texto))
+            nombre = patron_cant.sub("", nombre).strip(" -·:,")
+            if not nombre:
+                nombre = f"Pieza DXF"
+
+            filas.append({
+                "nombre": nombre, "largo": largo, "ancho": ancho,
+                "espesor": espesor, "cantidad": cant, "material": ""
+            })
+
+    if filas:
+        df = pd.DataFrame(filas)
+        return [df]
+    return []
+
+# ══════════════════════════════════════════════════════════════════════════════
 # AUDITORÍA
 # ══════════════════════════════════════════════════════════════════════════════
 class Auditoria:
