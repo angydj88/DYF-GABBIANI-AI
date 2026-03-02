@@ -1,0 +1,9 @@
+streamlit>=1.35.0
+google-generativeai>=0.8.0
+pandas>=2.0.0
+Pillow>=10.0.0
+openpyxl
+PyMuPDF>=1.24.0
+google-cloud-aiplatform>=1.64.0
+google-auth>=2.20.0
+typing_extensions>=4.5.0
