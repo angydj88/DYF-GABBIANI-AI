@@ -8,7 +8,9 @@ import json
 import re
 import time
 import os
+import random
 import logging
+import threading
 import typing_extensions as typing
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -266,7 +268,81 @@ class ExtractorVectorial:
         return piezas
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MOTOR VISIÓN IA
+# RATE LIMITER
+# ══════════════════════════════════════════════════════════════════════════════
+class RateLimiter:
+    """
+    Controla ritmo de llamadas API.
+    EU tiene límites estrictos: Flash ~15 RPM, Pro ~2-5 RPM.
+    """
+    def __init__(self, min_delay: float = 4.0, max_delay: float = 15.0):
+        self._lock = threading.Lock()
+        self._last_call = 0.0
+        self.min_delay = min_delay
+        self.max_delay = max_delay
+        self._consecutive_429 = 0
+
+    def wait(self):
+        with self._lock:
+            now = time.time()
+            elapsed = now - self._last_call
+            delay = self.min_delay + random.uniform(0.5, 2.0)
+            if self._consecutive_429 > 0:
+                penalty = min(self._consecutive_429 * 5.0, 60.0)
+                delay += penalty
+                logger.warning(f"⏳ Rate penalty: +{penalty:.1f}s (429x{self._consecutive_429})")
+            delay = min(delay, self.max_delay + self._consecutive_429 * 5.0)
+            if elapsed < delay:
+                wait_time = delay - elapsed
+                logger.info(f"⏱️ Rate limiter: esperando {wait_time:.1f}s")
+                time.sleep(wait_time)
+            self._last_call = time.time()
+
+    def report_success(self):
+        with self._lock:
+            self._consecutive_429 = 0
+
+    def report_rate_limit(self):
+        with self._lock:
+            self._consecutive_429 += 1
+
+    def get_backoff(self, intento: int) -> float:
+        base = min(2 ** (intento + 2), 120)
+        jitter = random.uniform(0, base * 0.5)
+        total = base + jitter
+        if self._consecutive_429 > 0:
+            total += self._consecutive_429 * 3.0
+        return min(total, 120.0)
+
+
+_GLOBAL_LIMITER = None
+
+def get_rate_limiter(model_name: str = "") -> RateLimiter:
+    global _GLOBAL_LIMITER
+    if _GLOBAL_LIMITER is None:
+        model_lower = model_name.lower()
+        if "pro" in model_lower or "2.5-pro" in model_lower:
+            _GLOBAL_LIMITER = RateLimiter(min_delay=12.0, max_delay=30.0)
+            logger.info("🔧 Rate limiter: PRO (12s entre llamadas)")
+        elif "flash" in model_lower:
+            _GLOBAL_LIMITER = RateLimiter(min_delay=4.0, max_delay=15.0)
+            logger.info("🔧 Rate limiter: FLASH (4s entre llamadas)")
+        else:
+            _GLOBAL_LIMITER = RateLimiter(min_delay=6.0, max_delay=20.0)
+            logger.info("🔧 Rate limiter: GENÉRICO (6s entre llamadas)")
+    return _GLOBAL_LIMITER
+
+
+def _is_rate_limit_error(error: Exception) -> bool:
+    err_str = str(error).lower()
+    return any(ind in err_str for ind in [
+        "429", "resource exhausted", "resource_exhausted",
+        "rate limit", "rate_limit", "quota",
+        "too many requests", "overloaded"
+    ])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MOTOR VISIÓN IA — CON RATE LIMITING
 # ══════════════════════════════════════════════════════════════════════════════
 MAX_TEXTO_VECTORIAL = 5000
 
@@ -293,12 +369,9 @@ def _preparar_imagen(img: Image.Image) -> bytes:
 
 class MotorVision:
     def __init__(self, backend, model_name, secrets_dict):
-        """
-        secrets_dict: diccionario con las claves necesarias
-        (evita acoplar con st.secrets)
-        """
         self.backend = backend
         self.model_name = model_name
+        self.limiter = get_rate_limiter(model_name)
         if self.backend == "vertex_ai":
             self._init_vertex(secrets_dict)
         else:
@@ -323,7 +396,7 @@ class MotorVision:
         self._model = genai.GenerativeModel(self.model_name)
 
     def analizar(self, imagen: Image.Image, texto_vectorial: str = "",
-                 max_intentos: int = 3) -> list:
+                 max_intentos: int = 4) -> list:
         img_bytes = _preparar_imagen(imagen)
         prompt = PROMPT_BASE
         if texto_vectorial and texto_vectorial.strip():
@@ -338,23 +411,46 @@ Si hay discrepancia entre texto e imagen, prioriza el texto vectorial.
         texto_respuesta = None
         for intento in range(max_intentos):
             try:
+                # ── Rate limiting ──
+                self.limiter.wait()
+                logger.info(f"  📡 API call (intento {intento+1}/{max_intentos})...")
+
                 if self.backend == "vertex_ai":
                     texto_respuesta = self._call_vertex(prompt, img_bytes)
                 else:
                     texto_respuesta = self._call_google_ai(prompt, img_bytes)
+
                 datos = json.loads(texto_respuesta)
                 if isinstance(datos, dict): datos = [datos]
+                self.limiter.report_success()
                 logger.info(f"  ✓ IA: {len(datos)} piezas (intento {intento+1})")
                 return datos
+
             except json.JSONDecodeError:
                 logger.warning(f"  ⚠ JSON inválido (intento {intento+1})")
-                if intento < max_intentos-1: time.sleep(2**intento); continue
+                self.limiter.report_success()  # API respondió, no es 429
+                if intento < max_intentos-1:
+                    time.sleep(2)
+                    continue
                 try: return self._fallback_fix(texto_respuesta or "")
                 except Exception: return [{"error":"JSON irreparable"}]
+
             except Exception as e:
-                logger.error(f"  ✗ Error API (intento {intento+1}): {e}")
-                if intento < max_intentos-1: time.sleep(2**intento); continue
-                return [{"error": str(e)}]
+                if _is_rate_limit_error(e):
+                    self.limiter.report_rate_limit()
+                    backoff = self.limiter.get_backoff(intento)
+                    logger.warning(f"  🚫 RATE LIMITED (intento {intento+1}): "
+                                   f"esperando {backoff:.1f}s — {e}")
+                    if intento < max_intentos-1:
+                        time.sleep(backoff)
+                        continue
+                    return [{"error": f"Rate limit tras {max_intentos} intentos"}]
+                else:
+                    logger.error(f"  ✗ Error API (intento {intento+1}): {e}")
+                    if intento < max_intentos-1:
+                        time.sleep(self.limiter.get_backoff(intento))
+                        continue
+                    return [{"error": str(e)}]
         return []
 
     def _call_vertex(self, prompt, img_bytes):
@@ -376,6 +472,7 @@ Si hay discrepancia entre texto e imagen, prioriza el texto vectorial.
         return resp.text
 
     def _fallback_fix(self, texto_roto):
+        self.limiter.wait()  # Rate limit también aquí
         pf = f"Corrige este JSON y devuelve SOLO el array JSON válido:\n{texto_roto}"
         if self.backend == "vertex_ai":
             from vertexai.generative_models import GenerationConfig
@@ -389,6 +486,7 @@ Si hay discrepancia entre texto e imagen, prioriza el texto vectorial.
                     temperature=0.0, response_mime_type="application/json",
                     response_schema=list[PiezaSchema]))
         d = json.loads(resp.text)
+        self.limiter.report_success()
         return [d] if isinstance(d,dict) else d
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -538,15 +636,17 @@ class CerebroOperarioV5:
         return piezas, alertas
 
 # ══════════════════════════════════════════════════════════════════════════════
-# WORKER (thread-safe)
+# WORKER (compatible con procesamiento secuencial)
 # ══════════════════════════════════════════════════════════════════════════════
 def worker_pagina(datos_pag: DatosPagina, motor: MotorVision) -> tuple:
     num = datos_pag.num + 1
+    # Vectorial primero — sin API
     if datos_pag.tiene_tablas:
         piezas_v = ExtractorVectorial.parsear_tablas(datos_pag.tablas, num)
         if piezas_v:
             return (num, piezas_v, OrigenDato.VECTOR_PDF,
                     f"VECTORIAL ({len(piezas_v)} pzs)")
+    # IA con rate limiting integrado
     datos_ia = motor.analizar(datos_pag.imagen, datos_pag.texto)
     if datos_ia and not (isinstance(datos_ia[0], dict) and "error" in datos_ia[0]):
         fuente = "HÍBRIDO" if datos_pag.tiene_texto else "VISIÓN"
@@ -585,27 +685,14 @@ def pdf_a_datos(archivo, dpi=300) -> list:
     return resultado
 
 # ══════════════════════════════════════════════════════════════════════════════
-# EXTRACTOR DXF (añadir en core.py)
+# EXTRACTOR DXF
 # ══════════════════════════════════════════════════════════════════════════════
-
 def extraer_datos_dxf(archivo_dxf) -> list:
-    """
-    Extrae datos de un archivo DXF y devuelve lista de DatosPagina.
-    
-    Estrategia: NO intentamos parsear geometría (demasiado ambiguo).
-    Extraemos textos + cotas como 'texto vectorial' y renderizamos
-    imagen para que Gemini haga el trabajo de identificación.
-    
-    Requiere: pip install ezdxf matplotlib
-    """
     import ezdxf
-    from ezdxf.addons.drawing import matplotlib as ezdxf_mpl
     import matplotlib
-    matplotlib.use('Agg')  # Sin GUI
-    import matplotlib.pyplot as plt
+    matplotlib.use('Agg')
 
     if hasattr(archivo_dxf, 'read'):
-        # Streamlit UploadedFile → guardar temporalmente
         import tempfile
         with tempfile.NamedTemporaryFile(suffix='.dxf', delete=False) as tmp:
             tmp.write(archivo_dxf.read())
@@ -616,16 +703,13 @@ def extraer_datos_dxf(archivo_dxf) -> list:
         doc = ezdxf.readfile(archivo_dxf)
 
     msp = doc.modelspace()
-
-    # ── 1. Extraer todos los textos ──
     textos = []
     for entity in msp:
         if entity.dxftype() == "TEXT":
             textos.append(entity.dxf.text)
         elif entity.dxftype() == "MTEXT":
-            textos.append(entity.text)  # MTEXT usa .text no .dxf.text
+            textos.append(entity.text)
 
-    # ── 2. Extraer todas las cotas ──
     cotas = []
     for entity in msp:
         if entity.dxftype() == "DIMENSION":
@@ -636,7 +720,6 @@ def extraer_datos_dxf(archivo_dxf) -> list:
             except Exception:
                 pass
 
-    # ── 3. Extraer textos de bloques (INSERT) ──
     for entity in msp:
         if entity.dxftype() == "INSERT":
             try:
@@ -657,10 +740,8 @@ def extraer_datos_dxf(archivo_dxf) -> list:
             except Exception:
                 pass
 
-    # ── 4. Construir texto vectorial ──
     texto_vectorial_parts = []
     if textos:
-        # Filtrar textos vacíos y duplicados, mantener orden
         textos_limpio = []
         vistos = set()
         for t in textos:
@@ -672,81 +753,52 @@ def extraer_datos_dxf(archivo_dxf) -> list:
         texto_vectorial_parts.extend(textos_limpio)
 
     if cotas:
-        # Ordenar cotas de mayor a menor para contexto
         cotas_unicas = sorted(set(cotas), reverse=True)
         texto_vectorial_parts.append(f"\nCOTAS ENCONTRADAS ({len(cotas_unicas)}):")
         texto_vectorial_parts.append(
-            ", ".join(f"{c}mm" for c in cotas_unicas[:50])  # Limitar
-        )
+            ", ".join(f"{c}mm" for c in cotas_unicas[:50]))
 
     texto_vectorial = "\n".join(texto_vectorial_parts)
-
-    # ── 5. Renderizar imagen ──
     imagen = _renderizar_dxf(doc)
-
-    # ── 6. Intentar parseo directo de tablas en texto ──
     tablas = _buscar_tablas_en_textos_dxf(textos)
 
     return [DatosPagina(
-        num=0,
-        imagen=imagen,
-        texto=texto_vectorial,
-        tablas=tablas,
-        tiene_texto=len(texto_vectorial) > 20,
-        tiene_tablas=len(tablas) > 0
-    )]
+        num=0, imagen=imagen, texto=texto_vectorial,
+        tablas=tablas, tiene_texto=len(texto_vectorial) > 20,
+        tiene_tablas=len(tablas) > 0)]
 
 
 def _renderizar_dxf(doc, dpi=200) -> Image.Image:
-    """Renderiza DXF a imagen PIL usando ezdxf backend."""
     try:
         from ezdxf.addons.drawing import RenderContext, Frontend
         from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
         import matplotlib.pyplot as plt
-
         fig = plt.figure(dpi=dpi)
         ax = fig.add_axes([0, 0, 1, 1])
-
         ctx = RenderContext(doc)
         out = MatplotlibBackend(ax)
         Frontend(ctx, out).draw_layout(doc.modelspace())
-
         ax.set_aspect('equal')
         ax.axis('off')
-
         buf = io.BytesIO()
         fig.savefig(buf, format='png', dpi=dpi, bbox_inches='tight',
                     pad_inches=0.1, facecolor='white')
         plt.close(fig)
         buf.seek(0)
         return Image.open(buf).copy()
-
     except Exception as e:
         logger.warning(f"Renderizado DXF falló ({e}), generando placeholder")
-        # Fallback: imagen blanca con texto
-        img = Image.new('RGB', (800, 600), 'white')
-        return img
+        return Image.new('RGB', (800, 600), 'white')
 
 
 def _buscar_tablas_en_textos_dxf(textos: list) -> list:
-    """
-    Intenta detectar si los textos del DXF forman una tabla de despiece.
-    Busca patrones como "PIEZA 800x450x19 2uds W980"
-    Retorna lista de DataFrames compatibles con ExtractorVectorial.
-    """
     import pandas as pd
-
-    # Patrón: número x número (opcionalmente x número)
     patron_medidas = re.compile(
         r'(\d+(?:[.,]\d+)?)\s*[xX×]\s*(\d+(?:[.,]\d+)?)'
-        r'(?:\s*[xX×]\s*(\d+(?:[.,]\d+)?))?'
-    )
-    # Patrón cantidad: 2uds, 3 ud, x4, qty:5
+        r'(?:\s*[xX×]\s*(\d+(?:[.,]\d+)?))?')
     patron_cant = re.compile(
         r'(\d+)\s*(?:ud|uds|pcs|pzs|unid)|[xX](\d+)|qty[:\s]*(\d+)',
-        re.IGNORECASE
-    )
-
+        re.IGNORECASE)
     filas = []
     for texto in textos:
         m = patron_medidas.search(str(texto))
@@ -754,27 +806,17 @@ def _buscar_tablas_en_textos_dxf(textos: list) -> list:
             largo = float(m.group(1).replace(",", "."))
             ancho = float(m.group(2).replace(",", "."))
             espesor = float(m.group(3).replace(",", ".")) if m.group(3) else 19.0
-
-            # Buscar cantidad
             cant = 1
             mc = patron_cant.search(str(texto))
             if mc:
                 cant = int(next(g for g in mc.groups() if g))
-
-            # El nombre es el texto limpio sin las medidas
             nombre = patron_medidas.sub("", str(texto))
             nombre = patron_cant.sub("", nombre).strip(" -·:,")
-            if not nombre:
-                nombre = f"Pieza DXF"
-
-            filas.append({
-                "nombre": nombre, "largo": largo, "ancho": ancho,
-                "espesor": espesor, "cantidad": cant, "material": ""
-            })
-
+            if not nombre: nombre = "Pieza DXF"
+            filas.append({"nombre":nombre,"largo":largo,"ancho":ancho,
+                          "espesor":espesor,"cantidad":cant,"material":""})
     if filas:
-        df = pd.DataFrame(filas)
-        return [df]
+        return [pd.DataFrame(filas)]
     return []
 
 # ══════════════════════════════════════════════════════════════════════════════
